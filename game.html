@@ -1,0 +1,329 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Farstep</title>
+<style>
+html,body{height:100%;margin:0;background:#111;overflow:hidden;font-family:Inter,system-ui,Segoe UI,Roboto,Arial}
+canvas{display:block;background:#6bb26b}
+.hud{position:fixed;right:16px;top:16px;color:#eaeaea;background:rgba(0,0,0,0.45);padding:10px;border-radius:8px;text-align:right;min-width:170px;line-height:1.35;backdrop-filter:blur(4px)}
+.hud div{font-weight:600;font-size:13px}
+.stat{font-weight:400;font-size:12px;color:#dcdcdc}
+.barwrap{background:rgba(0,0,0,0.25);height:8px;border-radius:6px;margin-top:6px;overflow:hidden}
+.bar{height:8px;border-radius:6px;background:linear-gradient(90deg,#ff6b6b,#ffb86b)}
+.small{font-size:11px;color:#bfc7c0}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div class="hud" id="hud">
+  <div id="distance">Distance: 0 m</div>
+  <div id="health">Health: 100</div>
+  <div class="barwrap"><div id="hpbar" class="bar" style="width:100%"></div></div>
+  <div id="level" style="margin-top:8px">Level: 0</div>
+  <div id="xp" class="stat">XP: 0 / 100</div>
+</div>
+
+<script>
+const canvas=document.getElementById('c'),ctx=canvas.getContext('2d',{alpha:false});
+let W=innerWidth,H=innerHeight;canvas.width=W;canvas.height=H;addEventListener('resize',()=>{W=innerWidth;H=innerHeight;canvas.width=W;canvas.height=H});
+
+const TILE=32,CHUNK_SIZE=16,PLAYER_RADIUS=10,BASE_SPEED=160,LAVA_DAMAGE_PER_SEC=10,LAVA_SLOW=0.5;
+const ENEMY_SPEED_MULT = 1.01;
+
+const T_GRASS=0,T_LAVA=1,T_SAND=2,T_ROCK=3;
+const TILE_COLORS={[T_GRASS]:'#5fb46a',[T_LAVA]:'#e25822',[T_SAND]:'#d9c79e',[T_ROCK]:'#6b6f74'};
+
+function fract(x){return x-Math.floor(x)}
+function hash(x,y){return fract(Math.sin(x*127.1+y*311.7)*43758.5453123)}
+function smoothNoise(x,y){
+  const xf=Math.floor(x),yf=Math.floor(y);
+  const v00=hash(xf,yf),v10=hash(xf+1,yf),v01=hash(xf,yf+1),v11=hash(xf+1,yf+1);
+  const wx=fract(x),wy=fract(y),sx=wx*wx*(3-2*wx),sy=wy*wy*(3-2*wy);
+  const a=v00*(1-sx)+v10*sx,b=v01*(1-sx)+v11*sx;
+  return a*(1-sy)+b*sy;
+}
+function fbm(x,y,oct=3){let sum=0,amp=1,freq=1,max=0;for(let i=0;i<oct;i++){sum+=smoothNoise(x*freq,y*freq)*amp;max+=amp;amp*=0.5;freq*=2;}return sum/max}
+
+const chunks=new Map();
+function chunkKey(cx,cy){return cx+','+cy}
+
+const enemies = new Map();
+function addEnemy(tx,ty){
+  const id = tx+','+ty; if(enemies.has(id)) return;
+  const base = {id,tx,ty,x:tx+0.5,y:ty+0.5,alive:true,despawned:false,active:false,stunnedUntil:0,invincibleUntil:0,lastAttackAt: -Infinity,baseMaxHealth:50,baseDamage:20,baseXP:20};
+  const distanceFactor = 1 + 0.1 * Math.floor(player.distance/500);
+  base.health = Math.round(base.baseMaxHealth * distanceFactor);
+  enemies.set(id, base);
+} 
+
+function genChunk(cx,cy){
+  const arr=new Uint8Array(CHUNK_SIZE*CHUNK_SIZE);
+  const baseX=cx*CHUNK_SIZE,baseY=cy*CHUNK_SIZE;
+  for(let j=0;j<CHUNK_SIZE;j++){
+    for(let i=0;i<CHUNK_SIZE;i++){
+      const x=baseX+i,y=baseY+j;
+      const vCluster=fbm(x*0.08,y*0.08,3);
+      const vDetail=fbm(x*0.28,y*0.28,2);
+      const lavaSeed=fbm(x*0.09+200,y*0.09-300,3);
+      let tile=T_GRASS;
+      if(vCluster>0.78) tile=T_LAVA;
+      else if(vCluster>0.72) tile=T_ROCK;
+      else if(vCluster>0.62) tile=T_SAND;
+      else {
+        const rare=vDetail;
+        if(rare>0.99) tile=T_LAVA;
+        else if(rare>0.96) tile=T_ROCK;
+        else if(rare>0.92) tile=T_SAND;
+      }
+      if(tile===T_GRASS){
+        const mix=hash(x*9301+1,y*9301+2);
+        if(mix>0.995) tile=T_ROCK;
+      }
+      if((tile===T_ROCK || tile===T_SAND) && lavaSeed>0.75){ if(hash(x+11,y-7)>0.35) tile=T_LAVA; }
+      arr[j*CHUNK_SIZE+i]=tile;
+      const enemySpawnChance = 0.003;
+      if(tile!==T_ROCK && hash(x*13+7,y*17+11) < enemySpawnChance){ addEnemy(x,y); }
+    }
+  }
+  return arr;
+}
+function tileAt(tx,ty){
+  const cx=Math.floor(tx/CHUNK_SIZE),cy=Math.floor(ty/CHUNK_SIZE),key=chunkKey(cx,cy);
+  if(!chunks.has(key))chunks.set(key,genChunk(cx,cy));
+  const chunk=chunks.get(key);
+  const lx=tx-cx*CHUNK_SIZE,ly=ty-cy*CHUNK_SIZE; return chunk[ly*CHUNK_SIZE+lx];
+}
+
+const spawn={x:0,y:0};
+const player={x:0,y:0,vx:0,vy:0,health:100,level:0,xp:0,lastDamageAt:-Infinity,regenCounter:0,distance:0,invincibleUntil:0,nextAttackAt:0};
+const distanceEl=document.getElementById('distance'),healthEl=document.getElementById('health'),hpbar=document.getElementById('hpbar');
+const levelEl=document.getElementById('level'),xpEl=document.getElementById('xp');
+
+function xpForLevel(l){let req=100;for(let i=1;i<=l;i++)req=Math.ceil(req*1.1);return req}
+function addXP(amount){player.xp+=Math.floor(amount);while(player.xp>=xpForLevel(player.level)){player.xp-=xpForLevel(player.level);player.level++}}
+
+const keys={};addEventListener('keydown',e=>{keys[e.key.toLowerCase()]=true});addEventListener('keyup',e=>{keys[e.key.toLowerCase()]=false});
+
+let mouseX=0,mouseY=0;
+const attackState = {active:false,startS:0,duration:0.1,angle:0};
+canvas.addEventListener('mousemove',e=>{mouseX=e.clientX;mouseY=e.clientY});
+canvas.addEventListener('mousedown',e=>{ if(e.button===0){ const nowS=performance.now()/1000; attemptAttack(nowS); } });
+
+// audio system
+const audioExts=['mp3','ogg','wav','m4a'];
+let damageSound=null, attackSound=null, musicSound=null;
+function tryLoadAudio(basenames, loop=false){
+  for(const base of basenames){
+    for(const ext of audioExts){
+      try{
+        const src = base + '.' + ext;
+        const a = new Audio(src);
+        a.preload = 'auto';
+        a.loop = !!loop;
+        a.addEventListener('canplaythrough', ()=>{
+          if(loop && !musicSound) musicSound = a;
+          if(!loop && !damageSound && basenames===damageNames) damageSound = a;
+        });
+        a.addEventListener('error', ()=>{});
+      }catch(e){}
+    }
+  }
+}
+const damageNames = ['damage','hit','damage1'];
+const attackNames = ['attack','swing','slash'];
+const musicNames = ['music','background','bg','music1','bgm'];
+// attempt to create audio objects; silent failure if files not present
+(function(){
+  for(const name of damageNames){
+    for(const ext of audioExts){
+      const a=new Audio(name+'.'+ext);
+      a.preload='auto';
+      a.addEventListener('canplaythrough', ()=>{ if(!damageSound) damageSound=a; });
+    }
+  }
+  for(const name of attackNames){
+    for(const ext of audioExts){
+      const a=new Audio(name+'.'+ext);
+      a.preload='auto';
+      a.addEventListener('canplaythrough', ()=>{ if(!attackSound) attackSound=a; });
+    }
+  }
+  for(const name of musicNames){
+    for(const ext of audioExts){
+      const a=new Audio(name+'.'+ext);
+      a.preload='auto'; a.loop=true;
+      a.addEventListener('canplaythrough', ()=>{ if(!musicSound) musicSound=a; });
+    }
+  }
+})();
+// try to enable audio on first user interaction (browsers often block autoplay)
+function tryEnableMusic(){ if(musicSound && musicSound.paused){ try{ musicSound.play().catch(()=>{}); }catch(e){} } }
+document.addEventListener('click', tryEnableMusic, {once:true});
+
+function playDamageSound(){ if(!damageSound) return; try{ damageSound.currentTime = 0; damageSound.play().catch(()=>{}); }catch(e){} }
+function playAttackSound(){ if(!attackSound) return; try{ attackSound.currentTime = 0; attackSound.play().catch(()=>{}); }catch(e){} }
+
+function worldToScreen(wx,wy){return {x:(wx-player.x)*TILE+W/2,y:(wy-player.y)*TILE+H/2}}
+
+function willCollideWithRocks(nx,ny){
+  const r=(PLAYER_RADIUS/TILE),minTx=Math.floor(nx-r),maxTx=Math.floor(nx+r),minTy=Math.floor(ny-r),maxTy=Math.floor(ny+r);
+  for(let ty=minTy;ty<=maxTy;ty++)for(let tx=minTx;tx<=maxTx;tx++)if(tileAt(tx,ty)===T_ROCK){
+    const closestX=Math.max(tx,Math.min(nx,tx+1)),closestY=Math.max(ty,Math.min(ny,ty+1));
+    const dx=nx-closestX,dy=ny-closestY;if(dx*dx+dy*dy<(PLAYER_RADIUS/TILE)*(PLAYER_RADIUS/TILE))return true;
+  }
+  return false;
+}
+
+const QUAD_SIZE = 200; const quadCache=new Map(); const collectedQuads=new Set(); function quadKey(qx,qy){return qx+','+qy}
+function deterministicInQuad(qx,qy,attempt){const a=Math.abs(Math.floor(hash(qx*931+attempt,qy*791+attempt)*QUAD_SIZE));const b=Math.abs(Math.floor(hash(qx*1571+attempt*3,qy*2713+attempt*5)*QUAD_SIZE));return {ox:a%QUAD_SIZE,oy:b%QUAD_SIZE}}
+function coinForQuadrant(qx,qy){const k=quadKey(qx,qy); if(collectedQuads.has(k)) return null; if(quadCache.has(k)) return quadCache.get(k); let fallback=null; let sandCandidate=null; for(let attempt=0; attempt<24; attempt++){const p=deterministicInQuad(qx,qy,attempt);const tx=qx*QUAD_SIZE+p.ox;const ty=qy*QUAD_SIZE+p.oy;const t=tileAt(tx,ty); if(t===T_SAND){ sandCandidate={tx,ty}; break;} if(t!==T_ROCK && !fallback) fallback={tx,ty}; } const chosen=sandCandidate||fallback||null; quadCache.set(k,chosen); return chosen }
+
+let randomCoin=null; function trySpawnRandomCoin(){ if(randomCoin) return; if(Math.random()>0.01) return; const attempts=12; let sandPick=null; for(let i=0;i<attempts;i++){const angle=Math.random()*Math.PI*2; const dist=200+Math.random()*2500; const tx=Math.floor(player.x+Math.cos(angle)*dist/TILE); const ty=Math.floor(player.y+Math.sin(angle)*dist/TILE); const t=tileAt(tx,ty); if(t===T_SAND){ sandPick={tx,ty}; break; } if(t!==T_ROCK && !sandPick) sandPick={tx,ty}; } if(sandPick && tileAt(sandPick.tx,sandPick.ty)!==T_ROCK) randomCoin=sandPick }
+function handleCoinCollection(){ const px=player.x,py=player.y; if(randomCoin){ const dx=px-(randomCoin.tx+0.5), dy=py-(randomCoin.ty+0.5); if(dx*dx+dy*dy<(PLAYER_RADIUS/TILE+0.3)*(PLAYER_RADIUS/TILE+0.3)){ addXP(10+Math.floor(player.distance/500)); randomCoin=null; } } const viewRadiusTilesX=Math.ceil(W/TILE/2),viewRadiusTilesY=Math.ceil(H/TILE/2); const viewQMinX=Math.floor((player.x-viewRadiusTilesX)/QUAD_SIZE)-1; const viewQMaxX=Math.floor((player.x+viewRadiusTilesX)/QUAD_SIZE)+1; const viewQMinY=Math.floor((player.y-viewRadiusTilesY)/QUAD_SIZE)-1; const viewQMaxY=Math.floor((player.y+viewRadiusTilesY)/QUAD_SIZE)+1; for(let qy=viewQMinY;qy<=viewQMaxY;qy++){ for(let qx=viewQMinX;qx<=viewQMaxX;qx++){ const k=quadKey(qx,qy); const coin=coinForQuadrant(qx,qy); if(!coin) continue; const dx=px-(coin.tx+0.5), dy=py-(coin.ty+0.5); if(dx*dx+dy*dy<(PLAYER_RADIUS/TILE+0.3)*(PLAYER_RADIUS/TILE+0.3)){ addXP(10+Math.floor(player.distance/500)); collectedQuads.add(k); quadCache.set(k,null); } } } }
+
+function enemyEffectiveStats(enemy){ const distanceFactor = 1 + 0.1 * Math.floor(player.distance/500); const maxHealth = enemy.baseMaxHealth * distanceFactor; const damage = enemy.baseDamage * distanceFactor; const xp = Math.floor(enemy.baseXP * distanceFactor); return {maxHealth,damage,xp}; }
+
+function damageEnemy(enemy, amount){
+  const now = performance.now()/1000; if(!enemy.alive || enemy.despawned) return;
+  if(now < enemy.invincibleUntil) return;
+  enemy.health -= amount;
+  enemy.stunnedUntil = now + 1;
+  enemy.invincibleUntil = now + 2;
+  if(enemy.health <= 0){ enemy.alive = false; const xp = enemyEffectiveStats(enemy).xp; addXP(xp); enemies.delete(enemy.id); }
+}
+
+let last=performance.now(),accRegen=0,sprintDamageTimer=0;
+function update(now){
+  const dt=Math.min(0.05,(now-last)/1000); last=now;
+  const inputX=((keys['d']||keys['arrowright'])?1:0)-((keys['a']||keys['arrowleft'])?1:0);
+  const inputY=((keys['s']||keys['arrowdown'])?1:0)-((keys['w']||keys['arrowup'])?1:0);
+  let len=Math.hypot(inputX,inputY), nx=player.x, ny=player.y;
+  const sprintActive = (keys['shift'] && len>0);
+  player.isSprinting = sprintActive;
+  if(len>0){
+    const normX=inputX/len,normY=inputY/len;
+    let speed=BASE_SPEED;
+    const tileUnder=tileAt(Math.floor(player.x),Math.floor(player.y));
+    if(tileUnder===T_LAVA) speed*=LAVA_SLOW;
+    if(tileUnder===T_SAND) speed*=0.5;
+    if(sprintActive) speed*=3;
+    const move=(speed*dt)/TILE;
+    nx+=normX*move; ny+=normY*move;
+    if(!willCollideWithRocks(nx,player.y)) player.x=nx; else nx=player.x;
+    if(!willCollideWithRocks(player.x,ny)) player.y=ny; else ny=player.y;
+    if(sprintActive){ sprintDamageTimer+=dt; while(sprintDamageTimer>=0.5){ sprintDamageTimer-=0.5; if(player.health>40){ player.health=Math.max(40,player.health-1); player.lastDamageAt=now/1000; player.regenCounter=0; } } } else sprintDamageTimer=0; 
+  } else sprintDamageTimer=0;
+
+  const tileNow = tileAt(Math.floor(player.x),Math.floor(player.y));
+  if(tileNow===T_LAVA){ const dmg=LAVA_DAMAGE_PER_SEC*dt; player.health-=dmg; player.lastDamageAt=now/1000; player.regenCounter=0; playDamageSound(); }
+  if(player.health<=0) respawn();
+
+  player.distance=Math.floor(Math.hypot(player.x-spawn.x,player.y-spawn.y));
+  distanceEl.textContent=`Distance: ${player.distance} m`;
+
+  if(now/1000 - player.lastDamageAt > 3){ accRegen+=dt; if(accRegen>=1){ const n=Math.floor(accRegen); for(let i=0;i<n;i++){ player.regenCounter++; const heal=player.regenCounter; player.health=Math.min(100,player.health+heal); if(player.health>=100){player.health=100;player.regenCounter=0;accRegen=0;break;} } accRegen-=n; } } else { accRegen=0; player.regenCounter=0 }
+
+  healthEl.textContent=`Health: ${Math.max(0,Math.round(player.health))}`;
+  hpbar.style.width=Math.max(0,Math.min(100,player.health))+'%';
+  levelEl.textContent=`Level: ${player.level}`;
+  xpEl.textContent=`XP: ${player.xp} / ${xpForLevel(player.level)}`;
+
+  trySpawnRandomCoin(); handleCoinCollection();
+
+  const playerSpeedNoSand = BASE_SPEED * (sprintActive?3:1) * (tileNow===T_LAVA?LAVA_SLOW:1);
+
+  const nowS = now/1000;
+  const removeIds=[];
+  enemies.forEach(enemy=>{
+    if(!enemy.alive || enemy.despawned) return;
+    const ex = enemy.x, ey = enemy.y;
+    const dx = player.x - ex, dy = player.y - ey;
+    const dist = Math.hypot(dx,dy);
+    if(!enemy.active && dist <= 5){ enemy.active = true; }
+    if(enemy.active){
+      if(dist >= 200){ enemy.despawned = true; removeIds.push(enemy.id); return; }
+      const stats = enemyEffectiveStats(enemy);
+      const distanceFactorNow = 1 + 0.1 * Math.floor(player.distance/500);
+      if(enemy.health === undefined){ enemy.health = Math.round(enemy.baseMaxHealth * distanceFactorNow); }
+      if(enemy._scaledFor !== distanceFactorNow){ if(enemy.health === enemy.baseMaxHealth){ enemy.health = Math.round(enemy.baseMaxHealth * distanceFactorNow); } enemy._scaledFor = distanceFactorNow; }
+      if(enemy.health > stats.maxHealth) enemy.health = stats.maxHealth;
+      if(nowS < enemy.stunnedUntil){ return; }
+      let enemySpeed = sprintActive ? playerSpeedNoSand * 0.9 : playerSpeedNoSand * 1.01;
+      const move = (enemySpeed * dt) / TILE;
+      if(dist > 0.001){
+        const nxE = enemy.x + (dx/dist)*move;
+        const nyE = enemy.y + (dy/dist)*move;
+        if(!willCollideWithRocks(nxE, enemy.y)) enemy.x = nxE; 
+        if(!willCollideWithRocks(enemy.x, nyE)) enemy.y = nyE;
+      }
+      const overlap = (Math.hypot(enemy.x - player.x, enemy.y - player.y) * TILE) < (PLAYER_RADIUS*2);
+      if(overlap && (nowS - enemy.lastAttackAt) >= 3){ enemy.lastAttackAt = nowS; if(nowS >= player.invincibleUntil){ const stats2 = enemyEffectiveStats(enemy); const rawDamage = stats2.damage; const effectiveDamage = rawDamage / (1 + 0.1 * player.level); player.health -= effectiveDamage; player.lastDamageAt = nowS; player.regenCounter = 0; player.invincibleUntil = nowS + 0.5; playDamageSound(); if(player.health <= 0) respawn(); } }
+    }
+  });
+  for(const id of removeIds) enemies.delete(id);
+
+  draw(nowS); requestAnimationFrame(update);
+}
+
+function attemptAttack(nowS){ if(nowS < player.nextAttackAt) return; player.nextAttackAt = nowS + 1; attackState.active = true; attackState.startS = nowS; const ang = Math.atan2(mouseY - H/2, mouseX - W/2); attackState.angle = ang; const dmg = 20 * (1 + 0.1 * player.level); if(attackSound) playAttackSound(); enemies.forEach(e=>{ if(!e.alive || e.despawned) return; const ex=e.x, ey=e.y; const dx=ex - player.x, dy=ey - player.y; const dist = Math.hypot(dx,dy); if(dist <= 1.0){ const angToEnemy = Math.atan2(dy,dx); let diff = angToEnemy - ang; while(diff > Math.PI) diff -= Math.PI*2; while(diff < -Math.PI) diff += Math.PI*2; if(Math.abs(diff) <= Math.PI/2){ damageEnemy(e, dmg); } } }); }
+
+function respawn(){
+  player.x = spawn.x; player.y = spawn.y;
+  player.health = 100; player.level = 0; player.xp = 0;
+  player.lastDamageAt = -Infinity; player.regenCounter = 0;
+  randomCoin = null; sprintDamageTimer = 0;
+  player.nextAttackAt = 0; player.invincibleUntil = 0; attackState.active = false;
+  chunks.clear(); enemies.clear(); quadCache.clear(); collectedQuads.clear();
+  // leave audio and UI as-is; map and enemies caches cleared so world behaves like fresh load
+}
+
+function draw(nowS){
+  ctx.clearRect(0,0,W,H);
+  const viewRadiusX=Math.ceil(W/TILE/2)+2,viewRadiusY=Math.ceil(H/TILE/2)+2;
+  const minTx=Math.floor(player.x)-viewRadiusX,maxTx=Math.floor(player.x)+viewRadiusX;
+  const minTy=Math.floor(player.y)-viewRadiusY,maxTy=Math.floor(player.y)+viewRadiusY;
+  for(let ty=minTy;ty<=maxTy;ty++)for(let tx=minTx;tx<=maxTx;tx++){
+    const t=tileAt(tx,ty),scr=worldToScreen(tx,ty);
+    ctx.fillStyle=TILE_COLORS[t]||'#000'; ctx.fillRect(Math.round(scr.x),Math.round(scr.y),TILE+1,TILE+1);
+    if(t===T_LAVA){ctx.fillStyle='rgba(255,255,255,0.05)';ctx.fillRect(Math.round(scr.x),Math.round(scr.y),TILE+1,TILE+1)}
+    if(t===T_ROCK){ctx.fillStyle='rgba(0,0,0,0.08)';ctx.fillRect(Math.round(scr.x),Math.round(scr.y),TILE+1,TILE+1)}
+  }
+
+  if(randomCoin){ const scr=worldToScreen(randomCoin.tx+0.5,randomCoin.ty+0.5); ctx.beginPath();ctx.arc(scr.x,scr.y,TILE*0.28,0,Math.PI*2);ctx.fillStyle='#ffd43b';ctx.fill();ctx.lineWidth=2;ctx.strokeStyle='#b8860b';ctx.stroke(); }
+
+  const viewQMinX = Math.floor((minTx)/QUAD_SIZE), viewQMaxX = Math.floor((maxTx)/QUAD_SIZE);
+  const viewQMinY = Math.floor((minTy)/QUAD_SIZE), viewQMaxY = Math.floor((maxTy)/QUAD_SIZE);
+  for(let qy=viewQMinY;qy<=viewQMaxY;qy++){
+    for(let qx=viewQMinX;qx<=viewQMaxX;qx++){
+      const coin = coinForQuadrant(qx,qy); if(!coin) continue; const scr = worldToScreen(coin.tx+0.5, coin.ty+0.5);
+      ctx.beginPath(); ctx.moveTo(scr.x, scr.y - TILE*0.32); for(let i=0;i<5;i++){ const ang = i*(Math.PI*2/5); ctx.lineTo(scr.x + Math.cos(ang)*TILE*0.22, scr.y + Math.sin(ang)*TILE*0.22); } ctx.fillStyle='#ffd700'; ctx.fill(); ctx.lineWidth=1; ctx.strokeStyle='#b8860b'; ctx.stroke();
+    }
+  }
+
+  enemies.forEach(enemy=>{
+    if(!enemy.alive || enemy.despawned) return;
+    const scr = worldToScreen(enemy.x, enemy.y);
+    ctx.beginPath(); ctx.arc(scr.x, scr.y, PLAYER_RADIUS*0.8, 0, Math.PI*2); ctx.fillStyle = (nowS < enemy.invincibleUntil) ? '#ff9b9b' : '#d33'; ctx.fill(); ctx.lineWidth = 2; ctx.strokeStyle = '#6b0000'; ctx.stroke();
+    const hp = Math.max(0, Math.round(enemy.health));
+    ctx.fillStyle = '#fff'; ctx.font = '12px system-ui'; ctx.textAlign='center'; ctx.fillText(hp, scr.x, scr.y - PLAYER_RADIUS*1.2);
+  });
+
+  if(attackState.active){
+    const elapsed = nowS - attackState.startS; const p = Math.min(1, elapsed / attackState.duration);
+    const px = W/2, py = H/2;
+    const startA = attackState.angle - Math.PI/2;
+    const sweep = Math.PI * p;
+    ctx.beginPath(); ctx.moveTo(px,py); ctx.arc(px,py,TILE*1.0, startA, startA + sweep); ctx.closePath(); ctx.fillStyle='rgba(60,60,60,0.95)'; ctx.fill();
+    if(p>=1) attackState.active = false;
+  }
+
+  const px=W/2,py=H/2; ctx.beginPath(); ctx.arc(px,py,PLAYER_RADIUS,0,Math.PI*2); ctx.fillStyle = (nowS < player.invincibleUntil) ? '#7fb8ff' : '#2b7cff'; ctx.fill(); ctx.strokeStyle='#082b7a'; ctx.lineWidth=2; ctx.stroke();
+}
+
+player.x=spawn.x; player.y=spawn.y; player.lastDamageAt=-Infinity; requestAnimationFrame(update);
+window._game = {enemies, damageEnemy, attemptAttack};
+</script>
+</body>
+</html>
